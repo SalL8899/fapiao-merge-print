@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>发票合并打印工具</title>
+
+<!-- ============================================
+     引入 pdf.js 库（CDN 方式）
+     pdf.js 由 Mozilla 开发，专门用来在网页里解析和渲染 PDF
+     这里用固定版本，避免新版接口变动导致出错
+     ============================================ -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+  // 告诉 pdf.js 它的 worker 文件在哪（pdf.js 把解析工作放到子线程里，需要单独指定 worker）
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+</script>
+
+<style>
+  /* ============ 屏幕显示样式（操作界面） ============ */
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Microsoft YaHei", sans-serif;
+    margin: 0;
+    padding: 20px;
+    background: #f5f6f8;
+    color: #333;
+  }
+  .container {
+    max-width: 800px;
+    margin: 0 auto;
+    background: #fff;
+    padding: 30px;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+  }
+  h1 { font-size: 22px; margin-top: 0; }
+  .tip { color: #888; font-size: 13px; line-height: 1.8; }
+  .upload-area {
+    display: block;          /* 关键：label 默认是行内元素，必须改成 block 才能独占一行、撑满宽度 */
+    width: 100%;             /* 宽度撑满父容器 */
+    border: 2px dashed #bbb;
+    border-radius: 8px;
+    padding: 40px;
+    text-align: center;
+    margin: 20px 0;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .upload-area:hover { border-color: #4a90d9; background: #f0f7ff; }
+  /* 拖拽文件悬停时的高亮样式，提示用户"可以松手了" */
+  .upload-area.dragover {
+    border-color: #4a90d9;
+    background: #e6f0ff;
+    border-style: solid;
+  }
+  .upload-area p { margin: 8px 0; color: #666; }
+  input[type="file"] { display: none; }
+  .btn {
+    background: #4a90d9;
+    color: #fff;
+    border: none;
+    padding: 12px 30px;
+    font-size: 16px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .btn:hover { background: #357abd; }
+  .btn:disabled { background: #ccc; cursor: not-allowed; }
+  .file-list { margin: 15px 0; font-size: 13px; color: #555; }
+  .file-list div {
+    padding: 6px 0;
+    display: flex;            /* 用 flex 让文件名和删除按钮左右分布 */
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid #f0f0f0;
+  }
+  .file-list .del-btn {
+    background: none;
+    border: none;
+    color: #c0392b;
+    cursor: pointer;
+    font-size: 16px;
+    padding: 0 6px;
+    line-height: 1;
+  }
+  .file-list .del-btn:hover { color: #e74c3c; }
+  /* 按钮行：左右两端对齐，"预览并打印"在左，"清空导入"在右 */
+  .btn-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .btn-clear {
+    background: #fff;
+    color: #c0392b;
+    border: 1px solid #c0392b;
+    padding: 11px 24px;
+    font-size: 15px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .btn-clear:hover { background: #fdf0ef; }
+  .btn-clear:disabled { color: #ccc; border-color: #ddd; cursor: not-allowed; background: #fff; }
+  #status { margin-top: 10px; color: #c0392b; font-size: 14px; }
+
+  /* ============ 预览区域（屏幕上看到的 A4 模样） ============ */
+  #preview { margin-top: 20px; }
+  .a4-page {
+    /* A4 宽高比：21 : 29.7。屏幕上按比例缩放显示 */
+    width: 210mm;
+    min-height: 297mm;
+    background: #fff;
+    margin: 0 auto 20px;
+    box-shadow: 0 0 8px rgba(0,0,0,0.15);
+    padding: 0;
+    position: relative;
+    /* 用 flex 上下排列两张发票 */
+    display: flex;
+    flex-direction: column;
+  }
+  .invoice-slot {
+    /* 每个发票槽位占半张 A4 的高度 */
+    height: 148.5mm;
+    display: flex;
+    align-items: center;   /* 上下居中 */
+    justify-content: center;
+    overflow: hidden;
+    border-bottom: 1px dashed #eee; /* 屏幕预览时方便区分两张，打印时会隐藏 */
+  }
+  .invoice-slot.full {
+    /* 独占整页的发票：高度撑满 */
+    height: 297mm;
+  }
+  .invoice-slot img {
+    /* 发票宽度固定 19.3cm，高度自适应 */
+    width: 193mm;
+    height: auto;
+    max-height: 100%;
+    object-fit: contain;
+  }
+
+  /* ============================================
+     @media print：打印时生效的样式
+     关键作用：隐藏操作界面，只保留发票内容，并严格按 A4 排版
+     ============================================ */
+  @media print {
+    @page {
+      /* 设置打印纸张为 A4，四周不留边距，保证尺寸精确 */
+      size: A4;
+      margin: 0;
+    }
+    /* 隐藏所有操作界面元素 */
+    .container, #status, .no-print { display: none !important; }
+
+    body { background: #fff; margin: 0; padding: 0; }
+
+    #preview { margin: 0; }
+
+    .a4-page {
+      /* 打印时每页严格 A4，且强制分页 */
+      width: 210mm;
+      height: 297mm;
+      min-height: 297mm;
+      margin: 0;
+      box-shadow: none;
+      page-break-after: always; /* 每张 A4 之后强制换页 */
+      break-after: page;
+    }
+    .a4-page:last-child {
+      page-break-after: auto; /* 最后一页不用再换页 */
+    }
+    .invoice-slot {
+      border-bottom: none; /* 打印时去掉预览用的虚线 */
+    }
+  }
+</style>
+</head>
+<body>
+
+<!-- 操作界面（打印时会整体隐藏） -->
+<div class="container no-print">
+  <h1>发票合并打印工具</h1>
+  <p class="tip">
+    📄 使用说明：把多张"半张 A4 大小"的 PDF 发票上传上来，工具会把它们<br>
+    两两上下拼接成一张标准 A4 纸，节省一半纸张。<br>
+    • 每张发票会统一缩放到 19.3cm 宽（A4 可打印宽度）。<br>
+    • 如果某张发票太高（超过半张 A4），会自动单独占一整页。<br>
+    • 奇数张时，最后一页下半部分留白。
+  </p>
+
+  <!-- 上传区域：点击或拖入都行 -->
+  <label class="upload-area" for="fileInput">
+    <p>📎 点击选择 PDF 发票文件（可多选）</p>
+    <p style="font-size:12px;color:#aaa;">支持同时选择多个 PDF 文件</p>
+  </label>
+  <input type="file" id="fileInput" accept="application/pdf" multiple>
+
+  <div class="file-list" id="fileList"></div>
+  <div class="btn-row">
+    <button class="btn" id="printBtn" disabled>预览并打印</button>
+    <button class="btn-clear" id="clearBtn" disabled>清空导入</button>
+  </div>
+  <div id="status"></div>
+</div>
+
+<!-- 预览与打印区域：这里动态生成一张张 A4 页面 -->
+<div id="preview"></div>
+
+<script>
+  // ===== 全局变量：保存用户选中的 PDF 文件 =====
+  let pdfFiles = [];
+
+  // ===== 拖拽上传功能 =====
+  // 浏览器对"拖文件进网页"有默认行为（直接打开文件），必须拦住
+  const uploadArea = document.querySelector('.upload-area');
+
+  // dragover：文件拖到区域上方时触发。preventDefault 是关键，否则 drop 不会触发
+  uploadArea.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    uploadArea.classList.add('dragover'); // 加高亮样式
+  });
+
+  // dragleave：文件拖出区域时触发，去掉高亮
+  uploadArea.addEventListener('dragleave', () => {
+    uploadArea.classList.remove('dragover');
+  });
+
+  // drop：用户松手放下文件时触发
+  uploadArea.addEventListener('drop', (e) => {
+    e.preventDefault();              // 拦住"打开文件"的默认行为
+    uploadArea.classList.remove('dragover');
+    // e.dataTransfer.files 就是拖进来的文件列表，用法和 input 的一样
+    // 只保留 PDF 类型，拼接到已有列表后面（支持多次拖拽累加）
+    const dropped = Array.from(e.dataTransfer.files).filter(f => f.type === 'application/pdf');
+    pdfFiles = pdfFiles.concat(dropped);
+    syncFileInput();
+    refreshUI();
+  });
+
+  // ===== 拿到页面里的元素，方便后面操作 =====
+  const fileInput = document.getElementById('fileInput');
+  const fileList = document.getElementById('fileList');
+  const printBtn = document.getElementById('printBtn');
+  const clearBtn = document.getElementById('clearBtn');
+  const status = document.getElementById('status');
+  const preview = document.getElementById('preview');
+
+  // ===== 关键尺寸常量（单位都是 cm，方便理解） =====
+  // A4：宽 21cm × 高 29.7cm
+  const A4_WIDTH_CM = 21;
+  const A4_HEIGHT_CM = 29.7;
+  const HALF_A4_HEIGHT_CM = A4_HEIGHT_CM / 2;  // 14.85cm，半张 A4 的高度
+  const TARGET_WIDTH_CM = 19.3;                // 发票统一缩放到的宽度
+
+  // ----- 用户选好文件后触发 ---
+  fileInput.addEventListener('change', (e) => {
+    pdfFiles = Array.from(e.target.files); // 把选中的文件转成数组
+    syncFileInput();  // 保持隐藏 input 与 pdfFiles 一致
+    refreshUI();
+  });
+
+  // 刷新界面：重新画文件清单 + 更新两个按钮的启用/禁用状态
+  function refreshUI() {
+    showFileList();
+    printBtn.disabled = pdfFiles.length === 0;
+    clearBtn.disabled = pdfFiles.length === 0;
+    status.textContent = '';
+  }
+
+  // 显示已选文件清单，每行带一个"×"删除按钮
+  function showFileList() {
+    fileList.innerHTML = '';
+    pdfFiles.forEach((f, i) => {
+      const div = document.createElement('div');
+      // 文件名放在一个 span 里，方便和删除按钮左右分布
+      const name = document.createElement('span');
+      name.textContent = `${i + 1}. ${f.name}`;
+      div.appendChild(name);
+
+      // 删除按钮：点它就删掉对应这一张
+      const del = document.createElement('button');
+      del.className = 'del-btn';
+      del.textContent = '×';
+      del.title = '删除这一张';
+      // 用闭包把当前序号 i 固定住，点击时才知道删的是哪一张
+      del.addEventListener('click', () => removeFile(i));
+      div.appendChild(del);
+
+      fileList.appendChild(div);
+    });
+  }
+
+  // 删除指定序号的发票文件
+  function removeFile(index) {
+    pdfFiles.splice(index, 1); // splice：从 index 处删掉 1 个元素
+    syncFileInput();
+    refreshUI();
+  }
+
+  // 清空所有已导入的发票
+  clearBtn.addEventListener('click', () => {
+    pdfFiles = [];        // 清空数组
+    syncFileInput();
+    refreshUI();
+    preview.innerHTML = ''; // 顺带清掉之前的预览
+  });
+
+  // 把 pdfFiles 数组同步回隐藏的 <input>，保持两处一致
+  function syncFileInput() {
+    const dt = new DataTransfer();
+    pdfFiles.forEach(f => dt.items.add(f));
+    fileInput.files = dt.files;
+  }
+
+  // --- 点击"预览并打印"按钮 ---
+  printBtn.addEventListener('click', async () => {
+    if (pdfFiles.length === 0) return;
+    printBtn.disabled = true;
+    status.textContent = '正在处理中，请稍候...';
+    preview.innerHTML = '';
+
+    try {
+      // 第一步：把所有 PDF 都解析出来，得到每张发票缩放后的图片和尺寸
+      const invoices = await renderAllPDFs();
+      // 第二步：按规则把发票配对、生成 A4 页面
+      const pages = arrangePages(invoices);
+      // 第三步：把页面画到网页上（既是预览，也是打印内容）
+      renderPages(pages);
+      status.textContent = `处理完成！共 ${pages.length} 页，可在下方预览。按 Ctrl+P 或调用打印即可。`;
+    } catch (err) {
+      console.error(err);
+      status.textContent = '出错了：' + err.message;
+    } finally {
+      printBtn.disabled = false;
+    }
+  });
+
+  // ===== 第一步：读取并渲染所有 PDF =====
+  // 返回一个数组，每个元素是 { imgSrc(图片地址), heightCm(缩放后的高度cm), name }
+  async function renderAllPDFs() {
+    const invoices = [];
+    for (const file of pdfFiles) {
+      status.textContent = `正在读取：${file.name}`;
+      // 把文件转成 pdf.js 能读的 ArrayBuffer
+      const arrayBuffer = await file.arrayBuffer();
+      // 用 pdf.js 加载这个 PDF
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+      // 一个 PDF 可能有多页，逐页都当成一张发票处理
+      for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+        const page = await pdf.getPage(pageNum);
+        // 取出这一页原始尺寸（单位是"PDF点"，1点=1/72英寸）
+        const viewport = page.getViewport({ scale: 1 });
+        const origWidthPt = viewport.width;
+        const origHeightPt = viewport.height;
+
+        // ----- 计算缩放后的高度（按宽度 19.3cm 等比例缩放） -----
+        // 比例 = 目标宽度 / 原始宽度。原始宽度用 cm 表示：1英寸=2.54cm，1英寸=72点
+        const origWidthCm = origWidthPt / 72 * 2.54;
+        const scale = TARGET_WIDTH_CM / origWidthCm;          // 缩放比例
+        const scaledHeightCm = (origHeightPt / 72 * 2.54) * scale;
+
+        // ----- 用 pdf.js 把这一页画到 canvas 上，再转成图片 -----
+        // 为了打印清晰，渲染时用较高分辨率（scale 越大越清晰但越慢）
+        const renderScale = 2; // 2 倍渲染，足够清晰
+        const renderViewport = page.getViewport({ scale: renderScale });
+        const canvas = document.createElement('canvas');
+        canvas.width = renderViewport.width;
+        canvas.height = renderViewport.height;
+        const ctx = canvas.getContext('2d');
+        // 白色背景，避免透明部分打印成黑色
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        await page.render({ canvasContext: ctx, viewport: renderViewport }).promise;
+        const imgSrc = canvas.toDataURL('image/jpeg', 0.92); // 转成图片地址
+
+        invoices.push({
+          imgSrc,
+          heightCm: scaledHeightCm,
+          name: `${file.name} (第${pageNum}页)`
+        });
+      }
+    }
+    return invoices;
+  }
+
+  // ===== 第二步：配对逻辑 =====
+  // 规则：
+  //  1) 某张发票高度 > 半张 A4(14.85cm) → 独占一整页
+  //  2) 其余发票按顺序两两上下拼到一页
+  //  3) 奇数张时最后一页下半留白
+  function arrangePages(invoices) {
+    const pages = []; // 每个元素是 { type:'single'|'pair', items:[...] }
+
+    // 先把"超大发票"和"正常发票"分开，但保持原顺序
+    // 用一个待配对队列，遇到超大的就单独成一页
+    let pending = null; // 等待配对的正常发票（最多攒 1 张）
+
+    for (const inv of invoices) {
+      if (inv.heightCm > HALF_A4_HEIGHT_CM) {
+        // 这张太大，先处理掉之前攒的那张（让它单独占一页上半，下半留白）
+        if (pending) {
+          pages.push({ type: 'pair', items: [pending, null] });
+          pending = null;
+        }
+        // 超大发票独占整页
+        pages.push({ type: 'single', items: [inv] });
+      } else {
+        // 正常发票：如果已经攒了一张，就配成一对
+        if (pending) {
+          pages.push({ type: 'pair', items: [pending, inv] });
+          pending = null;
+        } else {
+          pending = inv; // 先攒着，等下一张
+        }
+      }
+    }
+    // 收尾：最后还剩一张没配对的，下半留白
+    if (pending) {
+      pages.push({ type: 'pair', items: [pending, null] });
+    }
+    return pages;
+  }
+
+  // ===== 第三步：把页面画到网页上 =====
+  function renderPages(pages) {
+    preview.innerHTML = '';
+    pages.forEach(page => {
+      const a4 = document.createElement('div');
+      a4.className = 'a4-page';
+
+      if (page.type === 'single') {
+        // 独占整页
+        const slot = document.createElement('div');
+        slot.className = 'invoice-slot full';
+        const img = document.createElement('img');
+        img.src = page.items[0].imgSrc;
+        slot.appendChild(img);
+        a4.appendChild(slot);
+      } else {
+        // 上下两张
+        page.items.forEach(inv => {
+          const slot = document.createElement('div');
+          slot.className = 'invoice-slot';
+          if (inv) {
+            const img = document.createElement('img');
+            img.src = inv.imgSrc;
+            slot.appendChild(img);
+          }
+          // inv 为 null 时，这个槽位就是空的（留白）
+          a4.appendChild(slot);
+        });
+      }
+      preview.appendChild(a4);
+    });
+  }
+</script>
+</body>
+</html>
