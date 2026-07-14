@@ -107,6 +107,13 @@
 
   /* ============ 预览区域（屏幕上看到的 A4 模样） ============ */
   #preview { margin-top: 20px; }
+  /* 预览区被清空后的提示语（带 no-print，打印时自动隐藏，不会污染打印结果） */
+  .preview-tip {
+    text-align: center;
+    color: #999;
+    padding: 30px;
+    font-size: 14px;
+  }
   .a4-page {
     /* A4 宽高比：21 : 29.7。屏幕上按比例缩放显示 */
     width: 210mm;
@@ -256,17 +263,22 @@
 
   // ----- 用户选好文件后触发 ---
   fileInput.addEventListener('change', (e) => {
-    pdfFiles = Array.from(e.target.files); // 把选中的文件转成数组
-    syncFileInput();  // 保持隐藏 input 与 pdfFiles 一致
+    // input 每次选择都是独立的一批文件，浏览器不会自动累加，所以要手动拼到已有列表后面
+    const selected = Array.from(e.target.files).filter(f => f.type === 'application/pdf');
+    pdfFiles = pdfFiles.concat(selected); // 增量累加，与拖拽行为保持一致
     refreshUI();
+    // 关键：重置 input 的值。否则连续两次选同一个文件时，第二次因为"值没变"不会触发 change
+    e.target.value = '';
   });
 
   // 刷新界面：重新画文件清单 + 更新两个按钮的启用/禁用状态
+  // 同时清空预览——只要列表变过（删/清/传），旧预览就是过期快照，统一作废
   function refreshUI() {
     showFileList();
     printBtn.disabled = pdfFiles.length === 0;
     clearBtn.disabled = pdfFiles.length === 0;
     status.textContent = '';
+    clearPreview('文件列表已更新，请重新点击「预览并打印」');
   }
 
   // 显示已选文件清单，每行带一个"×"删除按钮
@@ -296,7 +308,7 @@
   function removeFile(index) {
     pdfFiles.splice(index, 1); // splice：从 index 处删掉 1 个元素
     syncFileInput();
-    refreshUI();
+    refreshUI(); // refreshUI 内部会清预览 + 提示，无需单独处理
   }
 
   // 清空所有已导入的发票
@@ -304,8 +316,16 @@
     pdfFiles = [];        // 清空数组
     syncFileInput();
     refreshUI();
-    preview.innerHTML = ''; // 顺带清掉之前的预览
   });
+
+  // 清空预览区，并显示一句提示（提示带 no-print，打印时自动隐藏）
+  function clearPreview(message) {
+    preview.innerHTML = '';
+    const tip = document.createElement('div');
+    tip.className = 'preview-tip no-print';
+    tip.textContent = message;
+    preview.appendChild(tip);
+  }
 
   // 把 pdfFiles 数组同步回隐藏的 <input>，保持两处一致
   function syncFileInput() {
