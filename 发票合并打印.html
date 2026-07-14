@@ -68,6 +68,26 @@
   }
   .btn:hover { background: #357abd; }
   .btn:disabled { background: #ccc; cursor: not-allowed; }
+  /* 打印按钮：放在中间，比另两个更大更显眼，用绿色强调"执行"语义 */
+  .btn-print {
+    background: #27ae60;
+    color: #fff;
+    border: none;
+    padding: 16px 48px;       /* 比普通按钮内边距更大 */
+    font-size: 18px;          /* 字号更大 */
+    font-weight: bold;
+    border-radius: 6px;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(39,174,96,0.4); /* 加阴影更突出 */
+    transition: all 0.2s;
+  }
+  .btn-print:hover { background: #219150; transform: translateY(-1px); }
+  .btn-print:disabled {
+    background: #ccc;
+    box-shadow: none;
+    cursor: not-allowed;
+    transform: none;
+  }
   .file-list { margin: 15px 0; font-size: 13px; color: #555; }
   .file-list div {
     padding: 6px 0;
@@ -206,7 +226,8 @@
 
   <div class="file-list" id="fileList"></div>
   <div class="btn-row">
-    <button class="btn" id="printBtn" disabled>预览并打印</button>
+    <button class="btn" id="previewBtn" disabled>预览</button>
+    <button class="btn-print" id="printBtn" disabled>🖨️ 打印</button>
     <button class="btn-clear" id="clearBtn" disabled>清空导入</button>
   </div>
   <div id="status"></div>
@@ -249,7 +270,8 @@
   // ===== 拿到页面里的元素，方便后面操作 =====
   const fileInput = document.getElementById('fileInput');
   const fileList = document.getElementById('fileList');
-  const printBtn = document.getElementById('printBtn');
+  const previewBtn = document.getElementById('previewBtn'); // 预览按钮：渲染生成 A4 预览
+  const printBtn = document.getElementById('printBtn');     // 打印按钮：触发浏览器打印
   const clearBtn = document.getElementById('clearBtn');
   const status = document.getElementById('status');
   const preview = document.getElementById('preview');
@@ -271,14 +293,15 @@
     e.target.value = '';
   });
 
-  // 刷新界面：重新画文件清单 + 更新两个按钮的启用/禁用状态
+  // 刷新界面：重新画文件清单 + 更新预览/清空按钮状态
   // 同时清空预览——只要列表变过（删/清/传），旧预览就是过期快照，统一作废
   function refreshUI() {
     showFileList();
-    printBtn.disabled = pdfFiles.length === 0;
+    previewBtn.disabled = pdfFiles.length === 0;
     clearBtn.disabled = pdfFiles.length === 0;
     status.textContent = '';
-    clearPreview('文件列表已更新，请重新点击「预览并打印」');
+    // 列表变了，预览作废；clearPreview 内部会把打印按钮也禁用，避免打到旧内容
+    clearPreview('文件列表已更新，请重新点击「预览」');
   }
 
   // 显示已选文件清单，每行带一个"×"删除按钮
@@ -325,6 +348,7 @@
     tip.className = 'preview-tip no-print';
     tip.textContent = message;
     preview.appendChild(tip);
+    printBtn.disabled = true; // 预览已失效，禁止打印，避免用户打到旧内容
   }
 
   // 把 pdfFiles 数组同步回隐藏的 <input>，保持两处一致
@@ -334,10 +358,11 @@
     fileInput.files = dt.files;
   }
 
-  // --- 点击"预览并打印"按钮 ---
-  printBtn.addEventListener('click', async () => {
+  // --- 点击"预览"按钮：渲染生成 A4 预览 ---
+  previewBtn.addEventListener('click', async () => {
     if (pdfFiles.length === 0) return;
-    printBtn.disabled = true;
+    previewBtn.disabled = true;
+    printBtn.disabled = true; // 渲染期间禁用打印，避免打到半成品
     status.textContent = '正在处理中，请稍候...';
     preview.innerHTML = '';
 
@@ -348,13 +373,23 @@
       const pages = arrangePages(invoices);
       // 第三步：把页面画到网页上（既是预览，也是打印内容）
       renderPages(pages);
-      status.textContent = `处理完成！共 ${pages.length} 页，可在下方预览。按 Ctrl+P 或调用打印即可。`;
+      // 预览生成成功 → 启用打印按钮。
+      // 关键：此时还没调用 window.print()，等用户真正点「打印」时才算直接手势，不会被浏览器拦截。
+      printBtn.disabled = false;
+      status.textContent = `已按最省纸方案排列，共 ${pages.length} 页。确认无误后点击「打印」。`;
     } catch (err) {
       console.error(err);
       status.textContent = '出错了：' + err.message;
     } finally {
-      printBtn.disabled = false;
+      previewBtn.disabled = false;
     }
+  });
+
+  // --- 点击"打印"按钮：直接触发浏览器打印对话框 ---
+  // 注意：window.print() 必须由用户点击直接触发，不能放在异步操作后面，否则浏览器会拦截。
+  // 所以这里按钮只做这一件事，手势有效。
+  printBtn.addEventListener('click', () => {
+    window.print();
   });
 
   // ===== 第一步：读取并渲染所有 PDF =====
@@ -406,40 +441,35 @@
     return invoices;
   }
 
-  // ===== 第二步：配对逻辑 =====
-  // 规则：
-  //  1) 某张发票高度 > 半张 A4(14.85cm) → 独占一整页
-  //  2) 其余发票按顺序两两上下拼到一页
-  //  3) 奇数张时最后一页下半留白
+  // ===== 第二步：配对逻辑（最省纸方案）=====
+  // 目标：用最少的 A4 纸，全局最多出现 1 个"半张空白"。
+  //
+  // 核心思路：
+  //  1) 大发票（高度 > 半页 14.85cm）→ 物理上放不下第二张，必须独占整页，无法避免。
+  //  2) 小发票（≤ 半页）→ 集中起来两两配对，绝不让大发票"插队"打散配对。
+  //     这样小发票不会因为被大发票打断而被迫单独占一页（那是浪费半张空白）。
+  //  3) 小发票为奇数张时，最后一张落单独占一页 → 恰好 1 个半张空白（允许的上限）。
+  //
+  // 证明最优：大发票必独占（硬约束），小发票两两配对是最密 packing，无可再省。
   function arrangePages(invoices) {
-    const pages = []; // 每个元素是 { type:'single'|'pair', items:[...] }
+    const pages = [];
 
-    // 先把"超大发票"和"正常发票"分开，但保持原顺序
-    // 用一个待配对队列，遇到超大的就单独成一页
-    let pending = null; // 等待配对的正常发票（最多攒 1 张）
+    // 先按尺寸分两类
+    const big = invoices.filter(v => v.heightCm > HALF_A4_HEIGHT_CM);
+    const small = invoices.filter(v => v.heightCm <= HALF_A4_HEIGHT_CM);
 
-    for (const inv of invoices) {
-      if (inv.heightCm > HALF_A4_HEIGHT_CM) {
-        // 这张太大，先处理掉之前攒的那张（让它单独占一页上半，下半留白）
-        if (pending) {
-          pages.push({ type: 'pair', items: [pending, null] });
-          pending = null;
-        }
-        // 超大发票独占整页
-        pages.push({ type: 'single', items: [inv] });
+    // 大发票：每张独占整页
+    big.forEach(v => pages.push({ type: 'single', items: [v] }));
+
+    // 小发票：两两配对，集中排列（不再被大发票打断）
+    for (let i = 0; i < small.length; i += 2) {
+      if (i + 1 < small.length) {
+        // 两张配成一页
+        pages.push({ type: 'pair', items: [small[i], small[i + 1]] });
       } else {
-        // 正常发票：如果已经攒了一张，就配成一对
-        if (pending) {
-          pages.push({ type: 'pair', items: [pending, inv] });
-          pending = null;
-        } else {
-          pending = inv; // 先攒着，等下一张
-        }
+        // 落单的最后一张：下半留白（这是全局唯一允许的半张空白）
+        pages.push({ type: 'pair', items: [small[i], null] });
       }
-    }
-    // 收尾：最后还剩一张没配对的，下半留白
-    if (pending) {
-      pages.push({ type: 'pair', items: [pending, null] });
     }
     return pages;
   }
